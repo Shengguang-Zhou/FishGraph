@@ -125,7 +125,7 @@ def create_prompt_examples():
     ]
     return prompt_examples
 
-def restrict_tokenizer_to_labels(tokenizer: PreTrainedTokenizer, label_words: List[str]):
+def restrict_tokenizer_to_labels(tokenizer: PreTrainedTokenizer, label_words: list[str]):
     """
     限制 Tokenizer 的词表，仅包含指定的标签词。
     Args:
@@ -230,7 +230,7 @@ def map_to_valid_label(self, predicted_label, valid_labels):
     if predicted_label in valid_labels:
         return predicted_label
     else:
-        # 如果标签无效，使用默认处理逻辑，例如返回“未知”或最近邻匹配
+        # 如果标签无效，使用默认处理逻辑，例如返回"未知"或最近邻匹配
         return "未知"  # 或者实现更复杂的相似度匹配
 
 def generate_output(self, input_texts):
@@ -271,6 +271,30 @@ def decode_label(self, label_idx):
         return self.id_to_label.get(label_idx, "UNKNOWN")
     else:
         raise ValueError("id_to_label mapping is missing.")
+
+def oversample_data(records, target_column="object", rare_classes=None):
+    """
+    对少量类样本进行过采样。
+    """
+    rare_classes = rare_classes or []
+    oversampled_records = []
+
+    for record in records:
+        if record[target_column] in rare_classes:
+            # 根据稀有类的比例复制样本
+            oversampled_records.extend([record] * 5)  # 5 是过采样倍数
+        else:
+            oversampled_records.append(record)
+
+    random.shuffle(oversampled_records)
+    return oversampled_records
+
+def get_most_common_label(train_recs, object2id):
+    label_counts = {k: 0 for k in object2id.keys()}
+    for rec in train_recs:
+        label_counts[rec["object"]] += 1
+    most_common_label = max(label_counts, key=label_counts.get)
+    return object2id[most_common_label]
 
 
 
@@ -341,10 +365,10 @@ class MultiModalDataset(Dataset):
         return None, text  # 返回默认值
 
     def augment_with_prompts(data, prompt_examples):
-    """
-    将插桩式 Prompt 数据整合到训练数据中。
-    """
-    return data + prompt_examples
+        """
+        将插桩式 Prompt 数据整合到训练数据中。
+        """
+        return data + prompt_examples
 
 
 ####################################################
@@ -377,12 +401,14 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         lr=DEFAULT_LR,
         freeze_text=FREEZE_TEXT,
         freeze_image=FREEZE_IMAGE,
-        num_objects=100  # 所有 object 的总数
+        num_objects=100,  # 所有 object 的总数
+        valid_labels=None
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.num_objects = num_objects
+        self.valid_labels = valid_labels or []
 
         # 1) XLM-R
       #  self.xlm_tokenizer = XLMRobertaTokenizer.from_pretrained(xlm_path)
@@ -630,7 +656,7 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         self.val_acc.reset()
 
     # --- test_step
-     def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx):
         device = self.device
         disease_texts = [b["disease_text"] for b in batch]
         images = [b["image"] for b in batch]
@@ -643,17 +669,26 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         preds = logits.argmax(dim=1)
 
         # Post-process labels using discrete label mapping
-        generated_labels = [map_to_label(self.num_objects, pred) for pred in preds.cpu().numpy()]
+        generated_labels = [map_to_valid_label(self.num_objects, pred) for pred in preds.cpu().numpy()]
 
         # predicter post process
         valid_labels = ["感染", "症状", "流行季节", "流行地区"]  # legal labels
 
+        # 获取 input_ids
+        input_ids = self.xlm_tokenizer(disease_texts, return_tensors="pt", padding=True).input_ids.to(self.device)
+        
         decoded_output = constrained_decoding(self, input_ids, label_words=valid_labels)
-
+        
+        # 使用解码结果
+        self.log("decoded_output", decoded_output, batch_size=len(batch))
+        
         corrected_labels = [
             label_discriminator(label, valid_labels) for label in generated_labels
         ]
-
+        
+        # 记录修正后的标签
+        self.log("corrected_labels", corrected_labels, batch_size=len(batch))
+        
         # truncate generated labels
         truncated_labels = [
             truncate_output(label, label_token="[LABEL]", max_tokens=3)
@@ -665,7 +700,11 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         self.log("test_loss", loss, batch_size=len(batch))
 
         # Return mapped labels and loss
-        return {"test_loss": loss, "generated_labels": generated_labels}
+        return {
+            "test_loss": loss, 
+            "generated_labels": generated_labels,
+            "corrected_labels": corrected_labels
+        }
 
     def predict(self, input_relation, input_text, threshold=0.7, valid_labels=None, default_label="UNKNOWN"):
         prompt = f"[LABEL] {input_relation} [EXPLANATION] {input_text}"
@@ -686,8 +725,14 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
 def raw_collate_fn(batch):
     return batch
 
-
-
+def cosine_similarity(str1, str2):
+    """简单的余弦相似度实现"""
+    set1 = set(str1)
+    set2 = set(str2)
+    intersection = set1.intersection(set2)
+    if not set1 or not set2:
+        return 0.0
+    return len(intersection) / (len(set1) * len(set2)) ** 0.5
 
 def main():
     parser = argparse.ArgumentParser()
@@ -726,15 +771,9 @@ def main():
     # 定义稀有类标签
     rare_classes = ["温度", "时间"]
 
-    # 过采样少量类
-    train_recs = oversample_data(train_recs, target_column="object", rare_classes=rare_classes)
-
-    # Prompt 强化
-    train_recs = augment_prompt_with_rare_classes(train_recs, rare_classes=rare_classes)
-
     # 2) 添加插桩式 Prompt 数据
     prompt_examples = create_prompt_examples()  # 调用插桩函数
-    recs = augment_with_prompts(recs, prompt_examples)  # 数据增强
+    recs = augment_prompt_with_rare_classes(recs, prompt_examples)  # 数据增强
 
     # 3) 收集所有object => 构建 object2id
     all_objects = list({r["object"] for r in recs})
@@ -748,11 +787,19 @@ def main():
     train_recs = recs[:split_idx]
     val_recs = recs[split_idx:]
     test_recs = val_recs
+    
+    # Prompt 强化
+    train_recs = augment_prompt_with_rare_classes(train_recs, rare_classes=rare_classes)
+
+    # 过采样少量类
+    train_recs = oversample_data(train_recs, target_column="object", rare_classes=rare_classes)
 
     # 构建Dataset => MultiModalDataset
     train_ds = MultiModalDataset(train_recs, object2id=object2id)
     val_ds   = MultiModalDataset(val_recs,   object2id=object2id)
     test_ds  = MultiModalDataset(test_recs,  object2id=object2id)
+
+    valid_labels = ["感染", "症状", "流行季节", "流行地区"]
 
     # 构建模型
     model = XLMClipViTMAECBAMModel(
@@ -762,7 +809,7 @@ def main():
         lr=args.lr,
         freeze_text=args.freeze_text,
         freeze_image=args.freeze_image,
-        num_objects=num_objs
+        num_objects=num_objs,
         valid_labels=valid_labels  # 将标签传入模型
     )
 
@@ -822,14 +869,16 @@ def main():
 
     print("Running Inference...")
     # 推理阶段
-    test_prompt = "[LABEL] 感染 [EXPLANATION] 该鱼种在春季易感"
     result = model.predict("感染", "该鱼种在春季易感")
     print("Prediction:", result)
+    
+
+    input_relation = "感染"
+    input_text = "该病可能由病毒传播，影响多种鱼类。"
     valid_labels = ["感染", "症状", "流行季节", "流行地区"]
 
-    result = predict(input_relation, input_text, model, threshold=0.7, valid_labels=valid_labels)
+    result = model.predict(input_relation, input_text, threshold=0.7, valid_labels=valid_labels)
     print("Predicted Label:", result["label"])
-    print("Explanation:", result["explanation"])
     print("Confidence:", result["confidence"])
     trainer.fit(model, train_loader, val_loader)
     trainer.test(model, test_loader, ckpt_path="best")
