@@ -24,6 +24,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchmetrics.classification import Accuracy
 from transformers import PreTrainedTokenizer
 
+from difflib import SequenceMatcher
+
 # ========== transformers相关 ============
 from transformers import (
     CLIPModel,
@@ -74,44 +76,51 @@ IMAGE_ROOT_DIR = r"C:\Users\yuyue\OneDrive\Documents\WeChat Files\wxid_0xz9g64ts
 ####################################################
 # Step 1: read CSV & parse partial triplets
 ####################################################
-def load_triplets(csv_file: str):
+def load_triplets(csv_file: str, image_root_dir: str):
     """
     读取annotation.csv，返回list[{...}]结构:
-      {
-        "image_path": ...
-        "text": ...
-        "disease": ...
-        "relation": ...
+    {
+        "image_path": ...,
+        "text": ...,
+        "disease": ...,
+        "relation": ...,
         "object": ...
-      }
+    }
     """
     if not os.path.exists(csv_file):
         raise FileNotFoundError(f"CSV not found: {csv_file}")
 
+    # 加载 CSV 文件
     df = pd.read_csv(csv_file, encoding="utf-8")
-    required_cols = ["id", "image_path", "text", "病名", "关系"]
+
+    # 检查必需列是否存在
+    required_cols = ["id", "image_path", "text", "病名", "关系", "感染对象"]
     for c in required_cols:
         if c not in df.columns:
-            print(f"[Error] Missing column {c} in CSV!")
-            return []
+            raise ValueError(f"[Error] Missing column {c} in CSV!")
 
+    # 转换为 triplets 格式
     triplets = []
     for _, row in df.iterrows():
         disease_name = str(row.get("病名", ""))
-        relation     = str(row.get("关系", ""))
-        obj = row.get("感染对象", None)   # 例如"感染对象"列
+        relation = str(row.get("关系", ""))
+        obj = row.get("感染对象", None)
+
+        # 跳过没有 "感染对象" 的行
         if pd.isna(obj) or str(obj).strip() == "":
             continue
 
         rec = {
-            "image_path": os.path.join(IMAGE_ROOT_DIR, str(row["image_path"]).replace("\\", "/")),
+            "image_path": os.path.join(image_root_dir, str(row["image_path"]).replace("\\", "/")),
             "text": str(row["text"]),
             "disease": disease_name,
             "relation": relation,
             "object": str(obj).strip()
         }
         triplets.append(rec)
+
     return triplets
+
 
 def create_prompt_examples():
     """
@@ -200,46 +209,53 @@ def truncate_output(generated_text, label_token="[LABEL]", max_tokens=3):
     
     return generated_text
 
-def constrained_decoding(model, input_ids, label_words, max_length=50):
+
+def constrained_decoding_with_truncation(tokenizer, input_ids, model, label_words, max_tokens=3):
     """
-    带约束的解码函数，确保 [LABEL] 后的输出只生成指定标签。
+    带约束的自适应截断解码，确保 [LABEL] 后只生成指定标签。
+    
     Args:
+        tokenizer: 用于分词和解码的 tokenizer 对象。
+        input_ids: 输入的 token ids（PyTorch 张量）。
         model: Transformer 模型。
-        input_ids: 输入的 Token IDs。
-        label_words: 可用标签集合。
-        max_length: 最大生成长度。
+        label_words: 合法标签列表，例如 ['感染', '症状', '流行季节', ...]。
+        max_tokens: [LABEL] 后允许生成的最大 token 数。
+    
     Returns:
-        str: 生成的文本。
+        Decoded string: 最终解码后的字符串。
     """
-    label_word_ids = model.tokenizer.convert_tokens_to_ids(label_words)
-    output_ids = model.generate(
-        input_ids=input_ids,
-        max_length=max_length,
-        pad_token_id=model.tokenizer.pad_token_id,
-        eos_token_id=model.tokenizer.eos_token_id,
-        forced_decoder_ids=[
-            (len(input_ids[0]), wid) for wid in label_word_ids  # 约束生成标签词
-        ]
-    )
-    return model.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    device = input_ids.device
+    valid_token_ids = tokenizer.convert_tokens_to_ids(label_words)  # 合法标签转为 token ids
+    output_ids = input_ids.clone()  # 初始化解码输出，复制 input_ids
 
-def map_to_valid_label(self, predicted_label, valid_labels):
-    """
-    将模型生成的标签映射到合法标签集合。
-    """
-    if predicted_label in valid_labels:
-        return predicted_label
-    else:
-        # 如果标签无效，使用默认处理逻辑，例如返回"未知"或最近邻匹配
-        return "未知"  # 或者实现更复杂的相似度匹配
+    # 初始模型状态
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            # 模型前向传播，获取 logits
+            outputs = model(input_ids=output_ids)
+            logits = outputs.logits[:, -1, :]  # 获取最后一个时间步的 logits
 
-def generate_output(self, input_texts):
-    inputs = self.tokenizer(input_texts, return_tensors="pt", padding=True).to(self.device)
-    outputs = self.model.generate(
-        **inputs, max_length=50, do_sample=True, temperature=0.7
-    )
-    decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    return decoded_outputs
+            # 设置非法 token 的概率为 -inf，确保模型只生成合法标签
+            mask = torch.full_like(logits, fill_value=-float('inf'), device=device)
+            mask[:, valid_token_ids] = logits[:, valid_token_ids]
+            filtered_logits = mask
+
+            # 选择概率最高的 token 作为下一个生成的 token
+            next_token = torch.argmax(filtered_logits, dim=-1).unsqueeze(-1)
+
+            # 如果生成了 <eos> 或无效 token，则停止解码
+            if next_token.item() == tokenizer.eos_token_id or next_token.item() not in valid_token_ids:
+                break
+
+            # 将生成的 token 拼接到输出序列中
+            output_ids = torch.cat([output_ids, next_token], dim=-1)
+
+    # 解码最终生成的序列
+    decoded_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return decoded_output
+
+
 
 def compute_loss_with_label_weighting(logits, labels, mask, weight_factor=2.0):
     """
@@ -323,8 +339,7 @@ class MultiModalDataset(Dataset):
 
     def __getitem__(self, idx):
         rec = self.records[idx]
-        #disease_text = f"{rec['disease']} {rec['relation']} {rec['text']}"
-        disease_text = f"[LABEL] {rec['relation']} [EXPLANATION] {rec['text']}"
+        disease_text = f"{rec['disease']} {rec['relation']} {rec['text']}"
         label_text, explanation_text = self._process_generated_output(rec['text'])
          # 合并 disease 和 relation 与 label_text 作为输入
         if label_text:
@@ -349,6 +364,8 @@ class MultiModalDataset(Dataset):
         return {
             "disease_text": disease_text,
             "explanation_text": explanation_text,
+            "relation": rec["relation"],
+            "text": rec['text'],
             "image": image,
             "obj_id": obj_id
         }
@@ -402,13 +419,17 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         freeze_text=FREEZE_TEXT,
         freeze_image=FREEZE_IMAGE,
         num_objects=100,  # 所有 object 的总数
-        valid_labels=None
+        valid_labels=["感染", "症状", "流行季节", "流行地区", "温度"]
+,  
+        object2id=None
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.num_objects = num_objects
         self.valid_labels = valid_labels or []
+        self.object2id = object2id  # 保存 object2id
+        self.tokenizer = XLMRobertaTokenizer.from_pretrained(xlm_path)
 
         # 1) XLM-R
       #  self.xlm_tokenizer = XLMRobertaTokenizer.from_pretrained(xlm_path)
@@ -427,11 +448,15 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         # 从 Hugging Face Hub 加载预训练模型
         self.xlm_tokenizer = XLMRobertaTokenizer.from_pretrained(xlm_path)
         self.xlm_model     = XLMRobertaModel.from_pretrained(xlm_path)
+        self.xlm_hidden_size = self.xlm_model.config.hidden_size
+
 
         self.clip_model     = CLIPModel.from_pretrained(clip_path)
         self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_path)
+        self.clip_proj_dim = self.clip_model.config.projection_dim
 
         self.vitmae_model = ViTMAEModel.from_pretrained(vitmae_path)
+        self.vitmae_hidden_size = self.vitmae_model.config.hidden_size
 
         # freeze
         if freeze_text:
@@ -475,7 +500,19 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
             T.Normalize((0.48145466,0.4578275,0.40821073),
                         (0.26862954,0.26130258,0.27577711))
         ])
-
+    
+    def edit_distance(self, a, b):
+        return SequenceMatcher(None, a, b).ratio()
+    
+    def map_to_valid_label(self, output_label, valid_labels):
+        if output_label in valid_labels:
+            return output_label
+        
+        # 使用编辑距离找到最接近的合法标签
+        closest_label = min(valid_labels, key=lambda label: self.edit_distance(output_label, label))
+        return closest_label
+    
+    
     # --- Encode text: XLM + CLIP => CBAM
     def encode_text_xlm(self, text_list, device):
         enc = self.xlm_tokenizer(
@@ -560,7 +597,12 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
 
         # 1. 格式化输入 Prompt
         # 使用 [LABEL] 和 [EXPLANATION] 格式的 Prompt
-        disease_texts = [f"[LABEL] {b['relation']} [EXPLANATION] {b['text']}" for b in batch]
+        #print(f"Batch sample: {batch[0]}") 
+        disease_texts = [
+            f"[LABEL] {b['relation']} [EXPLANATION] {b['text']} "
+            f"请确保 [LABEL] 的输出仅包含以下集合中的词：{', '.join(self.valid_labels)}"
+        for b in batch
+        ]
         images = [b["image"] for b in batch]
         labels = [b["obj_id"] for b in batch]  # ground truth object id
 
@@ -623,10 +665,16 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, batch_size=len(batch))
 
         # 添加 [LABEL] 通道受限解码逻辑
-        valid_labels = ["感染", "症状", "流行季节", "流行地区"]  # 定义合法标签集合
+        valid_labels = ["感染", "症状", "流行季节", "流行地区", "温度"]  # 定义合法标签集合
+        
+        object2id = {label: idx for idx, label in enumerate(valid_labels)}
+        print(f"[Info] object2id mapping: {object2id}")
         decoded_labels = [
-            self.map_to_valid_label(pred, valid_labels) for pred in preds.cpu().numpy()
+           valid_labels[pred] if pred < len(valid_labels) else "未知"
+           for pred in preds.cpu().numpy()
         ]
+
+        print(decoded_labels)
 
          # 结合置信度和标签
         results_with_confidence = [
@@ -665,59 +713,41 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         labels_tensor = torch.tensor(labels, dtype=torch.long, device=device)
         logits = self.forward(disease_texts, images)
 
+        label_words = ["感染", "症状", "流行季节", "流行地区", "温度"]
+
         # Generate predicted labels
         preds = logits.argmax(dim=1)
 
-        # Post-process labels using discrete label mapping
-        generated_labels = [map_to_valid_label(self.num_objects, pred) for pred in preds.cpu().numpy()]
+        max_tokens = 2
 
-        # predicter post process
-        valid_labels = ["感染", "症状", "流行季节", "流行地区"]  # legal labels
+        # 转换为 input_ids
+        input_ids = self.xlm_tokenizer(disease_texts, return_tensors="pt", padding=True).input_ids.to(device)
+        # 执行约束解码
+        result = constrained_decoding_with_truncation(
+                   tokenizer=self.tokenizer,
+                   input_ids=input_ids,
+                   model=self.xlm_model,  
+                   label_words=label_words,
+                   max_tokens=max_tokens
+                 )
 
-        # 获取 input_ids
-        input_ids = self.xlm_tokenizer(disease_texts, return_tensors="pt", padding=True).input_ids.to(self.device)
+        print("Constrained decoding result:", result)
         
-        decoded_output = constrained_decoding(self, input_ids, label_words=valid_labels)
-        
-        # 使用解码结果
-        self.log("decoded_output", decoded_output, batch_size=len(batch))
-        
-        corrected_labels = [
-            label_discriminator(label, valid_labels) for label in generated_labels
-        ]
-        
-        # 记录修正后的标签
-        self.log("corrected_labels", corrected_labels, batch_size=len(batch))
-        
-        # truncate generated labels
-        truncated_labels = [
-            truncate_output(label, label_token="[LABEL]", max_tokens=3)
-            for label in generated_labels
-        ]
-
-
         loss = self.loss_fn(logits, labels_tensor)
         self.log("test_loss", loss, batch_size=len(batch))
 
+        # 记录批次信息
+        self.log("batch_idx", batch_idx)
+
+        
         # Return mapped labels and loss
         return {
             "test_loss": loss, 
-            "generated_labels": generated_labels,
-            "corrected_labels": corrected_labels
+            "batch_idx": batch_idx  # 添加到返回值中
         }
 
-    def predict(self, input_relation, input_text, threshold=0.7, valid_labels=None, default_label="UNKNOWN"):
-        prompt = f"[LABEL] {input_relation} [EXPLANATION] {input_text}"
+ 
 
-        logits = self.forward([prompt], images=None).squeeze(0)
-        confidence = torch.softmax(logits, dim=-1).max().item()
-        output_idx = logits.argmax().item()
-
-        label = self.decode_label(output_idx)
-        if confidence < threshold or (valid_labels and label not in valid_labels):
-            label = default_label
-
-        return {"label": label, "confidence": confidence}
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -766,7 +796,7 @@ def main():
     print("=======================")
 
     # 1) 读取原始数据
-    recs = load_triplets(args.csv_file)
+    recs = load_triplets(args.csv_file, args.image_dir)
 
     # 定义稀有类标签
     rare_classes = ["温度", "时间"]
@@ -787,9 +817,6 @@ def main():
     train_recs = recs[:split_idx]
     val_recs = recs[split_idx:]
     test_recs = val_recs
-    
-    # Prompt 强化
-    train_recs = augment_prompt_with_rare_classes(train_recs, rare_classes=rare_classes)
 
     # 过采样少量类
     train_recs = oversample_data(train_recs, target_column="object", rare_classes=rare_classes)
@@ -799,7 +826,7 @@ def main():
     val_ds   = MultiModalDataset(val_recs,   object2id=object2id)
     test_ds  = MultiModalDataset(test_recs,  object2id=object2id)
 
-    valid_labels = ["感染", "症状", "流行季节", "流行地区"]
+    valid_labels = ["感染", "症状", "流行季节", "流行地区", "温度"]
 
     # 构建模型
     model = XLMClipViTMAECBAMModel(
@@ -810,7 +837,8 @@ def main():
         freeze_text=args.freeze_text,
         freeze_image=args.freeze_image,
         num_objects=num_objs,
-        valid_labels=valid_labels  # 将标签传入模型
+        valid_labels=valid_labels,  # 将标签传入模型
+        object2id=object2id
     )
 
     # Dataloader
@@ -818,21 +846,21 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         collate_fn=raw_collate_fn
     )
     val_loader= DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         collate_fn=raw_collate_fn
     )
     test_loader= DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         collate_fn=raw_collate_fn
     )
 
@@ -867,19 +895,6 @@ def main():
 
     print(f"Trainer device: {trainer.accelerator}, #devices={trainer.num_devices}")
 
-    print("Running Inference...")
-    # 推理阶段
-    result = model.predict("感染", "该鱼种在春季易感")
-    print("Prediction:", result)
-    
-
-    input_relation = "感染"
-    input_text = "该病可能由病毒传播，影响多种鱼类。"
-    valid_labels = ["感染", "症状", "流行季节", "流行地区"]
-
-    result = model.predict(input_relation, input_text, threshold=0.7, valid_labels=valid_labels)
-    print("Predicted Label:", result["label"])
-    print("Confidence:", result["confidence"])
     trainer.fit(model, train_loader, val_loader)
     trainer.test(model, test_loader, ckpt_path="best")
 

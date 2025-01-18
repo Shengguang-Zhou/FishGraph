@@ -1,0 +1,28 @@
+# 基础依赖
+torch==2.0.0
+torchvision==0.15.1
+torchaudio==2.0.0
+
+# 用于数据处理和加载
+numpy==1.25.0
+pandas==2.0.3
+Pillow==9.5.0
+
+# 图像处理相关
+torchmetrics==0.11.4
+opencv-python-headless==4.7.0.72
+
+# 模型和训练
+pytorch-lightning==2.0.6
+transformers==4.33.3
+
+# 可选依赖：可视化与调试
+matplotlib==3.7.2
+wandb==0.15.5
+
+# 学习率调度
+scipy==1.11.2
+
+# 其他
+tqdm==4.66.1
+sentencepiece==0.1.99
