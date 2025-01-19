@@ -19,6 +19,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
 # 使用 torchmetrics 进行多分类评估
 from torchmetrics.classification import Accuracy
@@ -419,12 +420,13 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         freeze_text=FREEZE_TEXT,
         freeze_image=FREEZE_IMAGE,
         num_objects=100,  # 所有 object 的总数
-        valid_labels=["感染", "症状", "流行季节", "流行地区", "温度"]
-,  
+        valid_labels=["感染", "症状", "流行季节", "流行地区"],
+        scheduler_type="cosine",  
         object2id=None
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.scheduler_type = scheduler_type
         self.lr = lr
         self.num_objects = num_objects
         self.valid_labels = valid_labels or []
@@ -665,7 +667,7 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, batch_size=len(batch))
 
         # 添加 [LABEL] 通道受限解码逻辑
-        valid_labels = ["感染", "症状", "流行季节", "流行地区", "温度"]  # 定义合法标签集合
+        valid_labels = ["感染", "症状", "流行季节", "流行地区"]  # 定义合法标签集合
         
         object2id = {label: idx for idx, label in enumerate(valid_labels)}
         print(f"[Info] object2id mapping: {object2id}")
@@ -750,7 +752,20 @@ class XLMClipViTMAECBAMModel(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        print("Scheduler type:", getattr(self, "scheduler_type", "Not found"))
+        if not hasattr(self, 'scheduler_type'):
+            raise ValueError("scheduler_type attribute is missing!")
+
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+        if self.scheduler_type == "cosine":
+           scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.trainer.max_epochs, eta_min=0)
+        elif self.scheduler_type == "step":
+           scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+        else:
+           raise ValueError(f"Unknown scheduler type: {self.scheduler_type}")
+
+        return [optimizer], [scheduler]
 
 def raw_collate_fn(batch):
     return batch
@@ -763,6 +778,19 @@ def cosine_similarity(str1, str2):
     if not set1 or not set2:
         return 0.0
     return len(intersection) / (len(set1) * len(set2)) ** 0.5
+
+class Trainer:
+    def __init__(self, model, scheduler: str = 'cosine', *args, **kwargs):
+        if scheduler == "cosine":
+            scheduler_type = "cosine"
+        elif scheduler == "step":
+            scheduler_type = "step"
+        else:
+            scheduler_type = "unknown"
+        
+        # 传递给模型
+        model.scheduler_type = scheduler_type
+        self.model = model
 
 def main():
     parser = argparse.ArgumentParser()
@@ -813,10 +841,17 @@ def main():
 
     # 4) 数据拆分
     random.shuffle(recs)
-    split_idx = int(0.8 * len(recs))
-    train_recs = recs[:split_idx]
-    val_recs = recs[split_idx:]
-    test_recs = val_recs
+
+     # 划分测试集：先取出 10% 数据作为测试集
+    test_ratio = 0.1
+    test_size = int(test_ratio * len(recs))
+    test_recs = recs[:test_size]
+    remaining_recs = recs[test_size:]  
+    val_ratio = 0.3  
+    val_size = int(val_ratio * len(remaining_recs))
+    val_recs = remaining_recs[:val_size]
+    train_recs = remaining_recs[val_size:] 
+
 
     # 过采样少量类
     train_recs = oversample_data(train_recs, target_column="object", rare_classes=rare_classes)
@@ -826,7 +861,7 @@ def main():
     val_ds   = MultiModalDataset(val_recs,   object2id=object2id)
     test_ds  = MultiModalDataset(test_recs,  object2id=object2id)
 
-    valid_labels = ["感染", "症状", "流行季节", "流行地区", "温度"]
+    valid_labels = ["感染", "症状", "流行季节", "流行地区"]
 
     # 构建模型
     model = XLMClipViTMAECBAMModel(
@@ -846,21 +881,21 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         collate_fn=raw_collate_fn
     )
     val_loader= DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
         collate_fn=raw_collate_fn
     )
     test_loader= DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
         collate_fn=raw_collate_fn
     )
 
