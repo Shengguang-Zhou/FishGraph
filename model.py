@@ -20,6 +20,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from peft import get_peft_model, LoraConfig
 
 # 使用 torchmetrics 进行多分类评估
 from torchmetrics.classification import Accuracy
@@ -235,7 +236,7 @@ def constrained_decoding_with_truncation(tokenizer, input_ids, model, label_word
         for _ in range(max_tokens):
             # 模型前向传播，获取 logits
             outputs = model(input_ids=output_ids)
-            logits = outputs.logits[:, -1, :]  # 获取最后一个时间步的 logits
+            logits = outputs.last_hidden_state[:, -1, :]  # 获取最后一个时间步的 logits
 
             # 设置非法 token 的概率为 -inf，确保模型只生成合法标签
             mask = torch.full_like(logits, fill_value=-float('inf'), device=device)
